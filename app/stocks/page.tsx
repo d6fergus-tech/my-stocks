@@ -6,7 +6,7 @@ import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } from "rec
 /* ========= Types & Config ========= */
 type Candle = { t: number; c: number };
 type TF = "1D" | "5D" | "1M" | "3M" | "6M" | "1Y" | "5Y";
-
+type Quote = { price: number; change: number; changePct: number };
 type QuoteResponse = { c?: number; d?: number; dp?: number };
 type ProfileResponse = { name?: string; finnhubIndustry?: string };
 
@@ -41,9 +41,11 @@ function fmt(n?: number, d = 2) {
 
 /* ========= Data fetchers ========= */
 // Quotes via Finnhub (REST polling every 60s)
+
 function useFinnhubQuotes(symbols: string[]) {
   const token = process.env.NEXT_PUBLIC_FINNHUB_KEY;
-  const [quotes, setQuotes] = useState<Record<string, { price: number; change: number; changePct: number }>>({});
+  const [quotes, setQuotes] = useState<Record<string, Quote>>({});
+
   useEffect(() => {
     if (!token || symbols.length === 0) return;
     let cancel = false;
@@ -52,14 +54,19 @@ function useFinnhubQuotes(symbols: string[]) {
       try {
         await Promise.all(
           symbols.map(async (sym) => {
-            const r = await fetch(`${FINNHUB_REST}/quote?symbol=${encodeURIComponent(sym)}&token=${token}`);
+            const r = await fetch(
+              `${FINNHUB_REST}/quote?symbol=${encodeURIComponent(sym)}&token=${token}`
+            );
             if (!r.ok) return;
             const q: QuoteResponse = await r.json();
-            if (!cancel && typeof q.c === "number") {
-              setQuotes((prev) => ({
-                ...prev,
-                [sym]: { price: q.c, change: q.d ?? 0, changePct: q.dp ?? 0 },
-              }));
+
+            if (cancel) return;
+            if (typeof q.c === "number") {
+              const price = q.c;
+              const change = typeof q.d === "number" ? q.d : 0;
+              const changePct = typeof q.dp === "number" ? q.dp : 0;
+              const entry: Quote = { price, change, changePct };
+              setQuotes((prev) => ({ ...prev, [sym]: entry }));
             }
           })
         );
@@ -74,7 +81,7 @@ function useFinnhubQuotes(symbols: string[]) {
       cancel = true;
       clearInterval(id);
     };
-  }, [symbols, token]); // include 'symbols' directly to satisfy ESLint
+  }, [symbols, token]);
 
   return quotes;
 }
