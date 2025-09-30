@@ -1,0 +1,14 @@
+node_modules/
+.next/
+out/
+.vercel/
+.env*
+!.env.example
+.env.local
+.DS_Store
+Thumbs.db
+*.log
+*.tsbuildinfo
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
