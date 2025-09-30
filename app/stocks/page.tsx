@@ -5,6 +5,10 @@ import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } from "rec
 
 /* ========= Types & Config ========= */
 type Candle = { t: number; c: number };
+type TF = "1D" | "5D" | "1M" | "3M" | "6M" | "1Y" | "5Y";
+
+type QuoteResponse = { c?: number; d?: number; dp?: number };
+type ProfileResponse = { name?: string; finnhubIndustry?: string };
 
 const DEFAULT_STOCKS = [
   { ticker: "ACLS", name: "Axcelis", sector: "Semis / AI", catalyst: "Chip capex orders 2025" },
@@ -19,9 +23,7 @@ const DEFAULT_STOCKS = [
   { ticker: "TRMD", name: "TORM", sector: "Shipping", catalyst: "High tanker rates" },
 ];
 
-const TIMEFRAMES = ["1D", "5D", "1M", "3M", "6M", "1Y", "5Y"] as const;
-type TF = (typeof TIMEFRAMES)[number];
-
+const TIMEFRAMES: TF[] = ["1D", "5D", "1M", "3M", "6M", "1Y", "5Y"];
 const FINNHUB_REST = "https://finnhub.io/api/v1";
 
 /* ========= Helpers ========= */
@@ -45,45 +47,49 @@ function useFinnhubQuotes(symbols: string[]) {
   useEffect(() => {
     if (!token || symbols.length === 0) return;
     let cancel = false;
+
     async function poll() {
       try {
         await Promise.all(
           symbols.map(async (sym) => {
-            const r = await fetch(
-              `${FINNHUB_REST}/quote?symbol=${encodeURIComponent(sym)}&token=${token}`
-            );
+            const r = await fetch(`${FINNHUB_REST}/quote?symbol=${encodeURIComponent(sym)}&token=${token}`);
             if (!r.ok) return;
-            const q: any = await r.json(); // { c, d, dp }
-            if (!cancel && q && typeof q.c === "number") {
-              setQuotes((prev) => ({ ...prev, [sym]: { price: q.c, change: q.d ?? 0, changePct: q.dp ?? 0 } }));
+            const q: QuoteResponse = await r.json();
+            if (!cancel && typeof q.c === "number") {
+              setQuotes((prev) => ({
+                ...prev,
+                [sym]: { price: q.c, change: q.d ?? 0, changePct: q.dp ?? 0 },
+              }));
             }
           })
         );
-      } catch {}
+      } catch {
+        // ignore transient errors
+      }
     }
+
     poll();
     const id = setInterval(poll, 60_000);
     return () => {
       cancel = true;
       clearInterval(id);
     };
-  }, [symbols.join("|"), token]);
+  }, [symbols, token]); // include 'symbols' directly to satisfy ESLint
+
   return quotes;
 }
 
 // Company profile (name/sector when adding a ticker)
 async function fetchProfile(symbol: string, token?: string) {
-  if (!token) return null as any;
+  if (!token) return null;
   try {
-    const r = await fetch(
-      `${FINNHUB_REST}/stock/profile2?symbol=${encodeURIComponent(symbol)}&token=${token}`
-    );
-    if (!r.ok) return null as any;
-    const j: any = await r.json();
-    if (!j || !Object.keys(j).length) return null as any;
-    return { name: j.name || symbol, sector: j.finnhubIndustry || "—" } as { name: string; sector: string };
+    const r = await fetch(`${FINNHUB_REST}/stock/profile2?symbol=${encodeURIComponent(symbol)}&token=${token}`);
+    if (!r.ok) return null;
+    const j: ProfileResponse = await r.json();
+    if (!j || !j.name) return null;
+    return { name: j.name || symbol, sector: j.finnhubIndustry || "—" };
   } catch {
-    return null as any;
+    return null;
   }
 }
 
@@ -92,8 +98,8 @@ async function fetchCandlesRange(symbol: string, tf: TF): Promise<Candle[]> {
   try {
     const r = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}`, { cache: "no-store" });
     if (!r.ok) return [];
-    const j: any = await r.json();
-    return (j?.data as Candle[]) || [];
+    const j: { data?: Candle[] } = await r.json();
+    return Array.isArray(j.data) ? j.data : [];
   } catch {
     return [];
   }
@@ -148,7 +154,7 @@ export default function StockTracker() {
         setLoading(false);
       }
     })();
-  }, [selected?.ticker, tf]);
+  }, [selected, tf]); // include 'selected' to satisfy ESLint
 
   const filtered = useMemo(() => {
     const f = filter.toLowerCase();
@@ -168,12 +174,12 @@ export default function StockTracker() {
       setCatalystInput("");
       return;
     }
-    let name = sym,
-      sector = "—";
+    let name = sym;
+    let sector = "—";
     const prof = await fetchProfile(sym, token);
     if (prof) {
-      name = prof.name || sym;
-      sector = prof.sector || "—";
+      name = prof.name;
+      sector = prof.sector;
     }
     setRows((prev) => [{ ticker: sym, name, sector, catalyst: catalystInput || "" }, ...prev]);
     setTickerInput("");
@@ -346,7 +352,7 @@ export default function StockTracker() {
                 />
                 <YAxis domain={["auto", "auto"]} width={60} />
                 <Tooltip
-                  formatter={(v) => fmt(Number(v))}
+                  formatter={(v: number) => fmt(Number(v))}
                   labelFormatter={(ts) => new Date(Number(ts)).toLocaleString()}
                 />
                 <Line type="monotone" dataKey="c" dot={false} strokeWidth={2} stroke="#111" />
@@ -354,11 +360,11 @@ export default function StockTracker() {
             </ResponsiveContainer>
           </div>
 
-          {/* Debug line shows number of points returned */}
           <div className="text-xs text-gray-500">
             {selected.ticker} {tf} • points: {detailData.length}
           </div>
 
+          {/* Messages */}
           {loading && <div className="text-sm text-gray-500">Loading chart…</div>}
           {!loading && msg && <div className="text-sm text-gray-500">{msg}</div>}
         </div>
