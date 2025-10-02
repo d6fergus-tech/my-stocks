@@ -11,6 +11,8 @@ type Quote = { price: number; change: number; changePct: number };
 type QuoteResponse = { c?: number; d?: number; dp?: number };
 type ProfileResponse = { name?: string; finnhubIndustry?: string };
 
+const STORAGE_KEY = "nightfallRows";
+const LEGACY_KEY = "stocksRows"; // old key we were using before
 const TIMEFRAMES: TF[] = ["1D", "5D", "1M", "3M", "6M", "1Y", "5Y"];
 const FINNHUB_REST = "https://finnhub.io/api/v1";
 
@@ -116,40 +118,36 @@ export default function StockTracker() {
   const symbols = useMemo(() => rows.map((r) => r.ticker), [rows]);
   const quotes = useFinnhubQuotes(symbols);
 
-  // load/save watchlist
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem("stocksRows");
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.every((x: any) => x && x.ticker)) setRows(parsed);
+// load watchlist (migrate old key once)
+useEffect(() => {
+  try {
+    const rawNew = localStorage.getItem(STORAGE_KEY);
+    if (rawNew) {
+      const parsed = JSON.parse(rawNew);
+      if (Array.isArray(parsed) && parsed.every((x: any) => x && x.ticker)) {
+        setRows(parsed);
+        return;
       }
-    } catch {}
-  }, []);
-  useEffect(() => {
-    try {
-      localStorage.setItem("stocksRows", JSON.stringify(rows));
-    } catch {}
-  }, [rows]);
+    }
+    // migrate legacy key if present, then clear it
+    const rawOld = localStorage.getItem(LEGACY_KEY);
+    if (rawOld) {
+      const parsed = JSON.parse(rawOld);
+      if (Array.isArray(parsed) && parsed.every((x: any) => x && x.ticker)) {
+        setRows(parsed);
+      }
+      localStorage.removeItem(LEGACY_KEY);
+    }
+  } catch {}
+}, []);
 
-  // load chart when selection/timeframe changes
-  useEffect(() => {
-    (async () => {
-      if (!selected) return;
-      const key = `${selected.ticker}_${tf}`;
-      setLoading(true);
-      setMsg(null);
-      try {
-        const data = await fetchCandlesRange(selected.ticker, tf);
-        if (!data?.length) setMsg("No data for this timeframe (try another range or market hours).");
-        setChartCache((p) => ({ ...p, [key]: data || [] }));
-      } catch {
-        setMsg("Couldn’t load chart data (network).");
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [selected, tf]);
+// save watchlist
+useEffect(() => {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(rows));
+  } catch {}
+}, [rows]);
+
 
   const filtered = useMemo(() => {
     const f = filter.toLowerCase();
