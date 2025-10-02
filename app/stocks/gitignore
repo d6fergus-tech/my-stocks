@@ -11,4 +11,3 @@ Thumbs.db
 *.tsbuildinfo
 pnpm-lock.yaml
 yarn.lock
-package-lock.json
