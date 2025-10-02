@@ -232,7 +232,7 @@ export default function StockTracker() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-end gap-3 justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">Nightfall Stocks</h1>
+          <h1 className="text-2xl font-bold text-white">D6 Stock Tracker</h1>
           <p className="text-sm text-gray-400 mt-1">
             {token
               ? isUSMarketOpenNow()

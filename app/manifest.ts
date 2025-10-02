@@ -1,7 +1,7 @@
 export default function manifest() {
   return {
-    name: "Nightfall Stocks",
-    short_name: "Nightfall",
+    name: "D6 Stock Tracker",
+    short_name: "D6 Stock Tracker",
     start_url: "/stocks",
     display: "standalone",
     background_color: "#000000",
