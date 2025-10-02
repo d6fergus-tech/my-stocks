@@ -7,21 +7,9 @@ import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } from "rec
 type Candle = { t: number; c: number };
 type TF = "1D" | "5D" | "1M" | "3M" | "6M" | "1Y" | "5Y";
 type Quote = { price: number; change: number; changePct: number };
+
 type QuoteResponse = { c?: number; d?: number; dp?: number };
 type ProfileResponse = { name?: string; finnhubIndustry?: string };
-
-const DEFAULT_STOCKS = [
-  { ticker: "ACLS", name: "Axcelis", sector: "Semis / AI", catalyst: "Chip capex orders 2025" },
-  { ticker: "MTSI", name: "MACOM", sector: "Semis / AI networking", catalyst: "High GM guidance" },
-  { ticker: "SITM", name: "SiTime", sector: "Semis / timing", catalyst: ">40% growth guide" },
-  { ticker: "AMKR", name: "Amkor", sector: "Advanced packaging", catalyst: "TSMC AZ build" },
-  { ticker: "COHR", name: "Coherent", sector: "Optics / materials", catalyst: "Diamond-SiC launch" },
-  { ticker: "OLLI", name: "Ollie's Bargain Outlet", sector: "Retail (off-price)", catalyst: "Raised outlook" },
-  { ticker: "PATK", name: "Patrick Industries", sector: "Cyclicals", catalyst: "RV recovery" },
-  { ticker: "GSHD", name: "Goosehead Insurance", sector: "Insurance (franchise)", catalyst: "Franchise growth" },
-  { ticker: "INMD", name: "InMode", sector: "Med-tech", catalyst: "Rerating potential" },
-  { ticker: "TRMD", name: "TORM", sector: "Shipping", catalyst: "High tanker rates" },
-];
 
 const TIMEFRAMES: TF[] = ["1D", "5D", "1M", "3M", "6M", "1Y", "5Y"];
 const FINNHUB_REST = "https://finnhub.io/api/v1";
@@ -41,7 +29,6 @@ function fmt(n?: number, d = 2) {
 
 /* ========= Data fetchers ========= */
 // Quotes via Finnhub (REST polling every 60s)
-
 function useFinnhubQuotes(symbols: string[]) {
   const token = process.env.NEXT_PUBLIC_FINNHUB_KEY;
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
@@ -114,7 +101,8 @@ async function fetchCandlesRange(symbol: string, tf: TF): Promise<Candle[]> {
 
 /* ========= Page ========= */
 export default function StockTracker() {
-  const [rows, setRows] = useState(DEFAULT_STOCKS);
+  // START EMPTY (no permanent defaults)
+  const [rows, setRows] = useState<Array<{ ticker: string; name: string; sector: string; catalyst: string }>>([]);
   const [filter, setFilter] = useState("");
   const [tickerInput, setTickerInput] = useState("");
   const [catalystInput, setCatalystInput] = useState("");
@@ -134,7 +122,7 @@ export default function StockTracker() {
       const saved = localStorage.getItem("stocksRows");
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.every((x) => x && x.ticker)) setRows(parsed);
+        if (Array.isArray(parsed) && parsed.every((x: any) => x && x.ticker)) setRows(parsed);
       }
     } catch {}
   }, []);
@@ -161,7 +149,7 @@ export default function StockTracker() {
         setLoading(false);
       }
     })();
-  }, [selected, tf]); // include 'selected' to satisfy ESLint
+  }, [selected, tf]);
 
   const filtered = useMemo(() => {
     const f = filter.toLowerCase();
@@ -196,6 +184,11 @@ export default function StockTracker() {
     setRows((prev) => prev.filter((r) => r.ticker !== sym));
     if (selected?.ticker === sym) setSelected(null);
   }
+  function clearAll() {
+    setRows([]);
+    setSelected(null);
+    try { localStorage.removeItem("stocksRows"); } catch {}
+  }
 
   const selectedKey = selected ? `${selected.ticker}_${tf}` : null;
   const detailData = selectedKey ? chartCache[selectedKey] || [] : [];
@@ -205,8 +198,8 @@ export default function StockTracker() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-end gap-3 justify-between">
         <div>
-          <h1 className="text-2xl font-bold">Top 10 Risk-Tolerant Watchlist</h1>
-          <p className="text-sm text-gray-500 mt-1">
+          <h1 className="text-2xl font-bold text-white">Nightfall Stocks</h1>
+          <p className="text-sm text-gray-400 mt-1">
             {token
               ? isUSMarketOpenNow()
                 ? "Live: quotes via Finnhub (60s) — Market open"
@@ -216,24 +209,25 @@ export default function StockTracker() {
         </div>
         <div className="flex items-center gap-3 w-full sm:w-auto">
           <input
-            className="border rounded px-3 py-2 w-full sm:w-64"
+            className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 w-full sm:w-64"
             placeholder="Filter by ticker, name, sector"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
           />
-          <button className="border rounded px-3 py-2" onClick={() => location.reload()}>
+          <button className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-3 py-2"
+            onClick={() => location.reload()}>
             Refresh
           </button>
         </div>
       </div>
 
-      {/* Add / Reset */}
-      <div className="rounded-2xl shadow p-4 grid gap-3 bg-white">
+      {/* Add / Clear */}
+      <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur p-4 grid gap-3">
         <div className="flex flex-col md:flex-row gap-3">
           <div className="flex-1">
-            <label className="text-xs text-gray-500">Ticker</label>
+            <label className="text-xs text-gray-400">Ticker</label>
             <input
-              className="border rounded px-3 py-2 w-full"
+              className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 w-full"
               placeholder="e.g., NVDA"
               value={tickerInput}
               onChange={(e) => setTickerInput(e.target.value)}
@@ -241,9 +235,9 @@ export default function StockTracker() {
             />
           </div>
           <div className="flex-[2]">
-            <label className="text-xs text-gray-500">Catalyst (optional)</label>
+            <label className="text-xs text-gray-400">Catalyst (optional)</label>
             <input
-              className="border rounded px-3 py-2 w-full"
+              className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 w-full"
               placeholder="Why this stock?"
               value={catalystInput}
               onChange={(e) => setCatalystInput(e.target.value)}
@@ -251,20 +245,21 @@ export default function StockTracker() {
             />
           </div>
           <div className="flex gap-2">
-            <button className="bg-black text-white rounded px-3 py-2" onClick={addSym}>
+            <button className="bg-white/10 hover:bg-white/20 text-white rounded px-3 py-2" onClick={addSym}>
               Add
             </button>
-            <button className="border rounded px-3 py-2" onClick={() => setRows(DEFAULT_STOCKS)}>
-              Reset
+            <button className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-3 py-2"
+              onClick={clearAll}>
+              Clear All
             </button>
           </div>
         </div>
       </div>
 
       {/* Table */}
-      <div className="rounded-2xl shadow p-4 bg-white overflow-x-auto">
+      <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur p-4 overflow-x-auto">
         <table className="w-full text-sm">
-          <thead>
+          <thead className="text-gray-300">
             <tr className="text-left">
               <th className="p-2">Ticker</th>
               <th className="p-2">Name</th>
@@ -276,21 +271,21 @@ export default function StockTracker() {
               <th className="p-2">Actions</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody className="text-gray-200">
             {filtered.map((s) => {
               const q = quotes[s.ticker];
               const up = (q?.change ?? 0) >= 0;
               return (
-                <tr key={s.ticker} className="border-t">
-                  <td className="p-2 font-semibold">{s.ticker}</td>
+                <tr key={s.ticker} className="border-t border-white/10">
+                  <td className="p-2 font-semibold text-white">{s.ticker}</td>
                   <td className="p-2">{s.name}</td>
                   <td className="p-2">{fmt(q?.price)}</td>
-                  <td className={`p-2 ${up ? "text-green-600" : "text-red-600"}`}>{fmt(q?.change)}</td>
-                  <td className={`p-2 ${up ? "text-green-600" : "text-red-600"}`}>{fmt(q?.changePct)}</td>
+                  <td className={`p-2 ${up ? "text-emerald-400" : "text-rose-400"}`}>{fmt(q?.change)}</td>
+                  <td className={`p-2 ${up ? "text-emerald-400" : "text-rose-400"}`}>{fmt(q?.changePct)}</td>
                   <td className="p-2">{s.sector}</td>
                   <td className="p-2 min-w-[220px]">
                     <input
-                      className="border rounded px-2 py-1 w-full"
+                      className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-2 py-1 w-full"
                       value={s.catalyst}
                       onChange={(e) =>
                         setRows((prev) =>
@@ -301,7 +296,7 @@ export default function StockTracker() {
                   </td>
                   <td className="p-2 space-x-2">
                     <button
-                      className="border rounded px-2 py-1"
+                      className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-2 py-1"
                       onClick={() => {
                         setTf("3M");
                         setSelected({ ticker: s.ticker, name: s.name });
@@ -309,26 +304,36 @@ export default function StockTracker() {
                     >
                       View
                     </button>
-                    <button className="border rounded px-2 py-1" onClick={() => removeSym(s.ticker)}>
+                    <button
+                      className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-2 py-1"
+                      onClick={() => removeSym(s.ticker)}
+                    >
                       Remove
                     </button>
                   </td>
                 </tr>
               );
             })}
+            {filtered.length === 0 && (
+              <tr>
+                <td className="p-4 text-gray-400" colSpan={8}>
+                  No stocks yet — add a ticker above to get started.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
 
       {/* Detail chart */}
       {selected && (
-        <div className="rounded-2xl shadow p-4 bg-white grid gap-3">
+        <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur p-4 grid gap-3">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <div>
-              <div className="text-lg font-semibold">
+              <div className="text-lg font-semibold text-white">
                 {selected.ticker} — {rows.find((r) => r.ticker === selected.ticker)?.name || selected.name}
               </div>
-              <div className="text-sm text-gray-500">
+              <div className="text-sm text-gray-400">
                 {rows.find((r) => r.ticker === selected.ticker)?.sector || ""}
               </div>
             </div>
@@ -336,13 +341,18 @@ export default function StockTracker() {
               {TIMEFRAMES.map((k) => (
                 <button
                   key={k}
-                  className={`px-2 py-1 rounded border ${tf === k ? "bg-black text-white" : ""}`}
+                  className={`px-2 py-1 rounded border border-white/10 ${
+                    tf === k ? "bg-white/20 text-white" : "bg-white/5 hover:bg-white/10 text-gray-200"
+                  }`}
                   onClick={() => setTf(k)}
                 >
                   {k}
                 </button>
               ))}
-              <button className="px-2 py-1 rounded border" onClick={() => setSelected(null)}>
+              <button
+                className="px-2 py-1 rounded border border-white/10 bg-white/5 hover:bg-white/10 text-white"
+                onClick={() => setSelected(null)}
+              >
                 Close
               </button>
             </div>
@@ -356,24 +366,26 @@ export default function StockTracker() {
                   type="number"
                   domain={["dataMin", "dataMax"]}
                   tickFormatter={(ts) => new Date(Number(ts)).toLocaleDateString()}
+                  stroke="#334155"
+                  tick={{ fill: "#cbd5e1", fontSize: 12 }}
                 />
-                <YAxis domain={["auto", "auto"]} width={60} />
+                <YAxis domain={["auto", "auto"]} width={60} stroke="#334155" tick={{ fill: "#cbd5e1", fontSize: 12 }} />
                 <Tooltip
                   formatter={(v: number) => fmt(Number(v))}
                   labelFormatter={(ts) => new Date(Number(ts)).toLocaleString()}
+                  contentStyle={{ background: "rgba(17, 24, 39, 0.9)", border: "1px solid rgba(255,255,255,0.1)", color: "#e5e7eb" }}
                 />
-                <Line type="monotone" dataKey="c" dot={false} strokeWidth={2} stroke="#111" />
+                <Line type="monotone" dataKey="c" dot={false} strokeWidth={2} stroke="#ffffff" />
               </LineChart>
             </ResponsiveContainer>
           </div>
 
-          <div className="text-xs text-gray-500">
+          <div className="text-xs text-gray-400">
             {selected.ticker} {tf} • points: {detailData.length}
           </div>
 
-          {/* Messages */}
-          {loading && <div className="text-sm text-gray-500">Loading chart…</div>}
-          {!loading && msg && <div className="text-sm text-gray-500">{msg}</div>}
+          {loading && <div className="text-sm text-gray-400">Loading chart…</div>}
+          {!loading && msg && <div className="text-sm text-gray-400">{msg}</div>}
         </div>
       )}
 
