@@ -14,21 +14,25 @@ function validId(id: string) {
 
 const redis = ready() ? Redis.fromEnv() : null;
 
+function scrub(s: string): string {
+  // Hide long token-like substrings
+  return s.replace(/[A-Za-z0-9_-]{20,}/g, "***");
+}
 function safeErr(e: unknown): string {
-  // Don’t leak secrets; just return a short message
-  if (e && typeof e === "object" && "message" in e) {
-    const msg = String((e as any).message || "");
-    // scrub anything that looks like a token or URL
-    return msg.replace(/[A-Za-z0-9_-]{20,}/g, "***");
+  try {
+    if (e instanceof Error) return scrub(e.message);
+    if (typeof e === "string") return scrub(e);
+    return scrub(JSON.stringify(e));
+  } catch {
+    return "Unknown error";
   }
-  return "Unknown error";
 }
 
 export async function GET(req: Request) {
   if (!ready()) return NextResponse.json({ error: "KV not configured" }, { status: 501 });
   try {
     const { searchParams } = new URL(req.url);
-    const id = searchParams.get("id") || "";
+    const id = searchParams.get("id") ?? "";
     if (!validId(id)) return NextResponse.json({ error: "bad id" }, { status: 400 });
 
     const key = `watchlist:${id}`;
@@ -47,12 +51,15 @@ export async function PUT(req: Request) {
   if (!ready()) return NextResponse.json({ error: "KV not configured" }, { status: 501 });
   try {
     const { searchParams } = new URL(req.url);
-    const id = searchParams.get("id") || "";
+    const id = searchParams.get("id") ?? "";
     if (!validId(id)) return NextResponse.json({ error: "bad id" }, { status: 400 });
 
-    const body = (await req.json().catch(() => null)) as { rows?: unknown };
-    const rows = body?.rows;
-    const okShape = Array.isArray(rows) && rows.every((v) => v && typeof v === "object" && "ticker" in v);
+    const bodyUnknown: unknown = await req.json().catch(() => null);
+    const rows = (bodyUnknown as { rows?: unknown } | null)?.rows;
+
+    const okShape =
+      Array.isArray(rows) && rows.every((v: unknown) => !!v && typeof v === "object" && "ticker" in (v as object));
+
     if (!okShape) return NextResponse.json({ error: "invalid rows" }, { status: 400 });
 
     const key = `watchlist:${id}`;
