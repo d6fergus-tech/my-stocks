@@ -3,20 +3,23 @@
 import { useEffect, useMemo, useState } from "react";
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } from "recharts";
 
-/* ========= Types & Config ========= */
-type Candle = { t: number; c: number };
+/* ========= Types ========= */
 type TF = "1D" | "5D" | "1M" | "3M" | "6M" | "1Y" | "5Y";
+type Candle = { t: number; c: number };
 type Quote = { price: number; change: number; changePct: number };
+type Row = { ticker: string; name: string; sector: string; catalyst: string };
 
 type QuoteResponse = { c?: number; d?: number; dp?: number };
 type ProfileResponse = { name?: string; finnhubIndustry?: string };
 
-const STORAGE_KEY = "nightfallRows";
-const LEGACY_KEY = "stocksRows"; // old key we were using before
+/* ========= Config ========= */
 const TIMEFRAMES: TF[] = ["1D", "5D", "1M", "3M", "6M", "1Y", "5Y"];
 const FINNHUB_REST = "https://finnhub.io/api/v1";
 
-/* ========= Helpers ========= */
+const STORAGE_KEY = "nightfallRows_v2"; // new key so old saved list doesn't auto-load
+const LEGACY_KEY = "stocksRows";        // migrate once if present
+
+/* ========= Utils ========= */
 function isUSMarketOpenNow() {
   const now = new Date();
   const d = now.getUTCDay(); // 0 Sun..6 Sat
@@ -28,9 +31,12 @@ function fmt(n?: number, d = 2) {
   if (n == null || Number.isNaN(n)) return "—";
   return n.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
 }
+function isRow(v: unknown): v is Row {
+  return !!v && typeof v === "object" && "ticker" in v;
+}
 
-/* ========= Data fetchers ========= */
-// Quotes via Finnhub (REST polling every 60s)
+/* ========= Data hooks ========= */
+// Live quotes via Finnhub (poll every 60s in client)
 function useFinnhubQuotes(symbols: string[]) {
   const token = process.env.NEXT_PUBLIC_FINNHUB_KEY;
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
@@ -48,13 +54,13 @@ function useFinnhubQuotes(symbols: string[]) {
             );
             if (!r.ok) return;
             const q: QuoteResponse = await r.json();
-
             if (cancel) return;
             if (typeof q.c === "number") {
-              const price = q.c;
-              const change = typeof q.d === "number" ? q.d : 0;
-              const changePct = typeof q.dp === "number" ? q.dp : 0;
-              const entry: Quote = { price, change, changePct };
+              const entry: Quote = {
+                price: q.c,
+                change: typeof q.d === "number" ? q.d : 0,
+                changePct: typeof q.dp === "number" ? q.dp : 0,
+              };
               setQuotes((prev) => ({ ...prev, [sym]: entry }));
             }
           })
@@ -79,7 +85,9 @@ function useFinnhubQuotes(symbols: string[]) {
 async function fetchProfile(symbol: string, token?: string) {
   if (!token) return null;
   try {
-    const r = await fetch(`${FINNHUB_REST}/stock/profile2?symbol=${encodeURIComponent(symbol)}&token=${token}`);
+    const r = await fetch(
+      `${FINNHUB_REST}/stock/profile2?symbol=${encodeURIComponent(symbol)}&token=${token}`
+    );
     if (!r.ok) return null;
     const j: ProfileResponse = await r.json();
     if (!j || !j.name) return null;
@@ -92,10 +100,14 @@ async function fetchProfile(symbol: string, token?: string) {
 // Candles via our server route (avoids CORS)
 async function fetchCandlesRange(symbol: string, tf: TF): Promise<Candle[]> {
   try {
-    const r = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}`, { cache: "no-store" });
+    const r = await fetch(
+      `/api/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}`,
+      { cache: "no-store" }
+    );
     if (!r.ok) return [];
-    const j: { data?: Candle[] } = await r.json();
-    return Array.isArray(j.data) ? j.data : [];
+    const j: unknown = await r.json();
+    const data = (j as { data?: Candle[] }).data;
+    return Array.isArray(data) ? data : [];
   } catch {
     return [];
   }
@@ -103,13 +115,15 @@ async function fetchCandlesRange(symbol: string, tf: TF): Promise<Candle[]> {
 
 /* ========= Page ========= */
 export default function StockTracker() {
-  // START EMPTY (no permanent defaults)
-  const [rows, setRows] = useState<Array<{ ticker: string; name: string; sector: string; catalyst: string }>>([]);
+  // Start EMPTY; user adds their own list
+  const [rows, setRows] = useState<Row[]>([]);
   const [filter, setFilter] = useState("");
   const [tickerInput, setTickerInput] = useState("");
   const [catalystInput, setCatalystInput] = useState("");
+
   const [selected, setSelected] = useState<{ ticker: string; name: string } | null>(null);
   const [tf, setTf] = useState<TF>("3M");
+
   const [chartCache, setChartCache] = useState<Record<string, Candle[]>>({});
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -118,36 +132,55 @@ export default function StockTracker() {
   const symbols = useMemo(() => rows.map((r) => r.ticker), [rows]);
   const quotes = useFinnhubQuotes(symbols);
 
-// load watchlist (migrate old key once)
-useEffect(() => {
-  try {
-    const rawNew = localStorage.getItem(STORAGE_KEY);
-    if (rawNew) {
-      const parsed = JSON.parse(rawNew);
-      if (Array.isArray(parsed) && parsed.every((x: any) => x && x.ticker)) {
-        setRows(parsed);
-        return;
+  /* Load saved list (new key), migrate legacy once */
+  useEffect(() => {
+    try {
+      const rawNew = localStorage.getItem(STORAGE_KEY);
+      if (rawNew) {
+        const parsed: unknown = JSON.parse(rawNew);
+        if (Array.isArray(parsed) && parsed.every(isRow)) {
+          setRows(parsed);
+          return;
+        }
       }
-    }
-    // migrate legacy key if present, then clear it
-    const rawOld = localStorage.getItem(LEGACY_KEY);
-    if (rawOld) {
-      const parsed = JSON.parse(rawOld);
-      if (Array.isArray(parsed) && parsed.every((x: any) => x && x.ticker)) {
-        setRows(parsed);
+      const rawOld = localStorage.getItem(LEGACY_KEY);
+      if (rawOld) {
+        const parsed: unknown = JSON.parse(rawOld);
+        if (Array.isArray(parsed) && parsed.every(isRow)) {
+          setRows(parsed);
+        }
+        localStorage.removeItem(LEGACY_KEY);
       }
-      localStorage.removeItem(LEGACY_KEY);
-    }
-  } catch {}
-}, []);
+    } catch {}
+  }, []);
 
-// save watchlist
-useEffect(() => {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(rows));
-  } catch {}
-}, [rows]);
+  /* Save list */
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(rows));
+    } catch {}
+  }, [rows]);
 
+  /* Load chart when selection/timeframe changes (with cache) */
+  useEffect(() => {
+    (async () => {
+      if (!selected) return;
+      const key = `${selected.ticker}_${tf}`;
+      if (chartCache[key]?.length) return; // already have it
+
+      setLoading(true);
+      setMsg(null);
+      try {
+        const data = await fetchCandlesRange(selected.ticker, tf);
+        if (!data.length) setMsg("No data for this timeframe (try another range or market hours).");
+        setChartCache((p) => ({ ...p, [key]: data }));
+      } catch {
+        setMsg("Couldn’t load chart data (network).");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [selected, tf, chartCache]);
 
   const filtered = useMemo(() => {
     const f = filter.toLowerCase();
@@ -185,12 +218,15 @@ useEffect(() => {
   function clearAll() {
     setRows([]);
     setSelected(null);
-    try { localStorage.removeItem("stocksRows"); } catch {}
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {}
   }
 
   const selectedKey = selected ? `${selected.ticker}_${tf}` : null;
-  const detailData = selectedKey ? chartCache[selectedKey] || [] : [];
+  const detailData: Candle[] = selectedKey ? chartCache[selectedKey] || [] : [];
 
+  /* ========= UI ========= */
   return (
     <div className="p-6 grid gap-4">
       {/* Header */}
@@ -212,8 +248,10 @@ useEffect(() => {
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
           />
-          <button className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-3 py-2"
-            onClick={() => location.reload()}>
+          <button
+            className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-3 py-2"
+            onClick={() => location.reload()}
+          >
             Refresh
           </button>
         </div>
@@ -246,8 +284,10 @@ useEffect(() => {
             <button className="bg-white/10 hover:bg-white/20 text-white rounded px-3 py-2" onClick={addSym}>
               Add
             </button>
-            <button className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-3 py-2"
-              onClick={clearAll}>
+            <button
+              className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-3 py-2"
+              onClick={clearAll}
+            >
               Clear All
             </button>
           </div>
@@ -371,7 +411,11 @@ useEffect(() => {
                 <Tooltip
                   formatter={(v: number) => fmt(Number(v))}
                   labelFormatter={(ts) => new Date(Number(ts)).toLocaleString()}
-                  contentStyle={{ background: "rgba(17, 24, 39, 0.9)", border: "1px solid rgba(255,255,255,0.1)", color: "#e5e7eb" }}
+                  contentStyle={{
+                    background: "rgba(17, 24, 39, 0.9)",
+                    border: "1px solid rgba(255,255,255,0.1)",
+                    color: "#e5e7eb",
+                  }}
                 />
                 <Line type="monotone" dataKey="c" dot={false} strokeWidth={2} stroke="#ffffff" />
               </LineChart>
