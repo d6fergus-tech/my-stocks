@@ -1,3 +1,4 @@
+// app/api/quote/route.ts
 import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -10,7 +11,6 @@ type QuoteOK = {
       regularMarketChange?: number;
       regularMarketChangePercent?: number;
     }>;
-    error?: unknown;
   };
 };
 
