@@ -59,7 +59,9 @@ function computeQuote(res: ChartResult | undefined) {
 
   const meta = res.meta ?? {};
   const closes = res.indicators?.quote?.[0]?.close ?? [];
-  let price =
+
+  // changed to const (lint fix)
+  const price =
     typeof meta.regularMarketPrice === "number"
       ? meta.regularMarketPrice
       : lastNonNull(closes);
@@ -88,10 +90,7 @@ export async function GET(req: Request) {
   }
 
   // Try intraday first, then fall back to daily if needed
-  const urls = [
-    buildUrl(symbol, "1d", "1m"),
-    buildUrl(symbol, "5d", "1d"),
-  ];
+  const urls = [buildUrl(symbol, "1d", "1m"), buildUrl(symbol, "5d", "1d")];
 
   for (const url of urls) {
     const data = await fetchChart(url);
@@ -102,9 +101,6 @@ export async function GET(req: Request) {
     }
   }
 
-  // If both attempts failed (network/401/etc.), report gracefully
-  return NextResponse.json(
-    { price: null, change: 0, changePct: 0 },
-    { status: 200 }
-  );
+  // If both attempts failed, return a graceful null price
+  return NextResponse.json({ price: null, change: 0, changePct: 0 }, { status: 200 });
 }
