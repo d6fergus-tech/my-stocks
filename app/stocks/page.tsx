@@ -1,437 +1,568 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } from "recharts";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+} from "recharts";
 
-/* ========= Types ========= */
-type TF = "1D" | "5D" | "1M" | "3M" | "6M" | "1Y" | "5Y";
-type Candle = { t: number; c: number };
-type Quote = { price: number; change: number; changePct: number };
+// ---------- Types ----------
 type Row = { ticker: string; name: string; sector: string; catalyst: string };
+type SyncStatus = "off" | "on" | "joining" | "error";
+type CandlePoint = { t: number; c: number }; // epoch ms, close
 
-type QuoteResponse = { c?: number; d?: number; dp?: number };
-type ProfileResponse = { name?: string; finnhubIndustry?: string };
+type SyncGet = { rows: Row[]; updatedAt: number };
+type SyncPut = { ok: true } | { error: string };
 
-/* ========= Config ========= */
-const TIMEFRAMES: TF[] = ["1D", "5D", "1M", "3M", "6M", "1Y", "5Y"];
-const FINNHUB_REST = "https://finnhub.io/api/v1";
+type TimeKey = "5D" | "1M" | "3M" | "1Y" | "5Y";
 
-const STORAGE_KEY = "nightfallRows_v2"; // new key so old saved list doesn't auto-load
-const LEGACY_KEY = "stocksRows";        // migrate once if present
+// ---------- Timeframe map for /api/candles ----------
+const TIMEFRAMES: Record<TimeKey, { range: string; interval: string; label: string }> = {
+  "5D": { range: "5d", interval: "15m", label: "5D" },
+  "1M": { range: "1mo", interval: "1d", label: "1M" },
+  "3M": { range: "3mo", interval: "1d", label: "3M" },
+  "1Y": { range: "1y", interval: "1d", label: "1Y" },
+  "5Y": { range: "5y", interval: "1wk", label: "5Y" },
+};
 
-/* ========= Utils ========= */
-function isUSMarketOpenNow() {
-  const now = new Date();
-  const d = now.getUTCDay(); // 0 Sun..6 Sat
-  if (d === 0 || d === 6) return false;
-  const m = now.getUTCHours() * 60 + now.getUTCMinutes();
-  return m >= 13 * 60 + 30 && m <= 20 * 60; // 9:30–16:00 ET
-}
-function fmt(n?: number, d = 2) {
-  if (n == null || Number.isNaN(n)) return "—";
-  return n.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
-}
-function isRow(v: unknown): v is Row {
-  return !!v && typeof v === "object" && "ticker" in v;
-}
+// ---------- Helpers ----------
+const clampTicker = (s: string) =>
+  s.toUpperCase().trim().replace(/[^A-Z0-9\.\-]/g, "").slice(0, 8);
 
-/* ========= Data hooks ========= */
-// Live quotes via Finnhub (poll every 60s in client)
-function useFinnhubQuotes(symbols: string[]) {
-  const token = process.env.NEXT_PUBLIC_FINNHUB_KEY;
-  const [quotes, setQuotes] = useState<Record<string, Quote>>({});
-
-  useEffect(() => {
-    if (!token || symbols.length === 0) return;
-    let cancel = false;
-
-    async function poll() {
-      try {
-        await Promise.all(
-          symbols.map(async (sym) => {
-            const r = await fetch(
-              `${FINNHUB_REST}/quote?symbol=${encodeURIComponent(sym)}&token=${token}`
-            );
-            if (!r.ok) return;
-            const q: QuoteResponse = await r.json();
-            if (cancel) return;
-            if (typeof q.c === "number") {
-              const entry: Quote = {
-                price: q.c,
-                change: typeof q.d === "number" ? q.d : 0,
-                changePct: typeof q.dp === "number" ? q.dp : 0,
-              };
-              setQuotes((prev) => ({ ...prev, [sym]: entry }));
-            }
-          })
-        );
-      } catch {
-        // ignore transient errors
-      }
-    }
-
-    poll();
-    const id = setInterval(poll, 60_000);
-    return () => {
-      cancel = true;
-      clearInterval(id);
-    };
-  }, [symbols, token]);
-
-  return quotes;
+function newCode(len = 8) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[(Math.random() * chars.length) | 0];
+  return out;
 }
 
-// Company profile (name/sector when adding a ticker)
-async function fetchProfile(symbol: string, token?: string) {
-  if (!token) return null;
+async function safeFetchJson<T>(input: string, init?: RequestInit): Promise<T | null> {
   try {
-    const r = await fetch(
-      `${FINNHUB_REST}/stock/profile2?symbol=${encodeURIComponent(symbol)}&token=${token}`
-    );
+    const r = await fetch(input, { cache: "no-store", ...init });
     if (!r.ok) return null;
-    const j: ProfileResponse = await r.json();
-    if (!j || !j.name) return null;
-    return { name: j.name || symbol, sector: j.finnhubIndustry || "—" };
+    const j = (await r.json()) as unknown;
+    return j as T;
   } catch {
     return null;
   }
 }
 
-// Candles via our server route (avoids CORS)
-async function fetchCandlesRange(symbol: string, tf: TF): Promise<Candle[]> {
-  try {
-    const r = await fetch(
-      `/api/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}`,
-      { cache: "no-store" }
-    );
-    if (!r.ok) return [];
-    const j: unknown = await r.json();
-    const data = (j as { data?: Candle[] }).data;
-    return Array.isArray(data) ? data : [];
-  } catch {
-    return [];
-  }
+function toChart(points: CandlePoint[]): { time: string; price: number }[] {
+  return points.map((p) => ({
+    time: new Date(p.t).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    }),
+    price: Number(p.c ?? 0),
+  }));
 }
 
-/* ========= Page ========= */
-export default function StockTracker() {
-  // Start EMPTY; user adds their own list
+// Try to normalize various /api/candles shapes into CandlePoint[]
+function normalizeCandles(j: unknown): CandlePoint[] {
+  // Accept { t: number[], c: number[] }
+  if (
+    j &&
+    typeof j === "object" &&
+    "t" in (j as Record<string, unknown>) &&
+    "c" in (j as Record<string, unknown>)
+  ) {
+    const o = j as { t?: unknown; c?: unknown };
+    if (Array.isArray(o.t) && Array.isArray(o.c) && o.t.length === o.c.length) {
+      const out: CandlePoint[] = [];
+      for (let i = 0; i < o.t.length; i++) {
+        const ts = Number(o.t[i]);
+        const cl = Number(o.c[i]);
+        if (Number.isFinite(ts) && Number.isFinite(cl)) {
+          out.push({ t: ts, c: cl });
+        }
+      }
+      return out;
+    }
+  }
+  // Accept { points: [{t,c}] }
+  if (j && typeof j === "object" && "points" in (j as Record<string, unknown>)) {
+    const o = j as { points?: unknown };
+    if (Array.isArray(o.points)) {
+      const out: CandlePoint[] = [];
+      for (const v of o.points) {
+        if (v && typeof v === "object" && "t" in v && "c" in v) {
+          const ts = Number((v as { t: unknown }).t);
+          const cl = Number((v as { c: unknown }).c);
+          if (Number.isFinite(ts) && Number.isFinite(cl)) out.push({ t: ts, c: cl });
+        }
+      }
+      return out;
+    }
+  }
+  // Accept array [{t,c}]
+  if (Array.isArray(j)) {
+    const out: CandlePoint[] = [];
+    for (const v of j) {
+      if (v && typeof v === "object" && "t" in v && "c" in v) {
+        const ts = Number((v as { t: unknown }).t);
+        const cl = Number((v as { c: unknown }).c);
+        if (Number.isFinite(ts) && Number.isFinite(cl)) out.push({ t: ts, c: cl });
+      }
+    }
+    return out;
+  }
+  return [];
+}
+
+// ---------- Page ----------
+export default function StocksPage() {
+  // UI / theme is handled by Tailwind classes here (nightfall gradient)
   const [rows, setRows] = useState<Row[]>([]);
-  const [filter, setFilter] = useState("");
-  const [tickerInput, setTickerInput] = useState("");
-  const [catalystInput, setCatalystInput] = useState("");
+  const [tickerIn, setTickerIn] = useState("");
+  const [nameIn, setNameIn] = useState("");
+  const [sectorIn, setSectorIn] = useState("");
+  const [catIn, setCatIn] = useState("");
 
-  const [selected, setSelected] = useState<{ ticker: string; name: string } | null>(null);
-  const [tf, setTf] = useState<TF>("3M");
+  const [selected, setSelected] = useState<string>(""); // ticker for chart
+  const [tf, setTf] = useState<TimeKey>("3M");
+  const [chart, setChart] = useState<CandlePoint[] | null>(null);
+  const [chartMsg, setChartMsg] = useState<string>("Pick a stock to view a chart…");
+  const [chartLoading, setChartLoading] = useState(false);
 
-  const [chartCache, setChartCache] = useState<Record<string, Candle[]>>({});
-  const [loading, setLoading] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
+  // Sync
+  const [syncId, setSyncId] = useState<string>("");
+  const [joinCode, setJoinCode] = useState("");
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>("off");
+  const lastSeenRef = useRef<number>(0);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const token = process.env.NEXT_PUBLIC_FINNHUB_KEY;
-  const symbols = useMemo(() => rows.map((r) => r.ticker), [rows]);
-  const quotes = useFinnhubQuotes(symbols);
-
-  /* Load saved list (new key), migrate legacy once */
+  // Load stored sync code + rows from localStorage first
   useEffect(() => {
     try {
-      const rawNew = localStorage.getItem(STORAGE_KEY);
-      if (rawNew) {
-        const parsed: unknown = JSON.parse(rawNew);
-        if (Array.isArray(parsed) && parsed.every(isRow)) {
-          setRows(parsed);
-          return;
-        }
+      const sid = localStorage.getItem("syncId");
+      if (sid) setSyncId(sid.toUpperCase());
+      const cache = localStorage.getItem("rows");
+      if (cache) {
+        const parsed = JSON.parse(cache) as Row[];
+        if (Array.isArray(parsed)) setRows(parsed);
       }
-      const rawOld = localStorage.getItem(LEGACY_KEY);
-      if (rawOld) {
-        const parsed: unknown = JSON.parse(rawOld);
-        if (Array.isArray(parsed) && parsed.every(isRow)) {
-          setRows(parsed);
-        }
-        localStorage.removeItem(LEGACY_KEY);
-      }
-    } catch {}
+    } catch {
+      // ignore
+    }
   }, []);
 
-  /* Save list */
+  // Persist rows locally (so the page keeps your watchlist even w/out sync)
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(rows));
-    } catch {}
+      localStorage.setItem("rows", JSON.stringify(rows));
+    } catch {
+      /* ignore */
+    }
   }, [rows]);
 
-  /* Load chart when selection/timeframe changes (with cache) */
+  // Start or stop polling when syncId changes
   useEffect(() => {
-    (async () => {
-      if (!selected) return;
-      const key = `${selected.ticker}_${tf}`;
-      if (chartCache[key]?.length) return; // already have it
-
-      setLoading(true);
-      setMsg(null);
-      try {
-        const data = await fetchCandlesRange(selected.ticker, tf);
-        if (!data.length) setMsg("No data for this timeframe (try another range or market hours).");
-        setChartCache((p) => ({ ...p, [key]: data }));
-      } catch {
-        setMsg("Couldn’t load chart data (network).");
-      } finally {
-        setLoading(false);
+    if (!syncId) {
+      setSyncStatus("off");
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
       }
-    })();
-  }, [selected, tf, chartCache]);
-
-  const filtered = useMemo(() => {
-    const f = filter.toLowerCase();
-    return rows.filter(
-      (r) =>
-        r.ticker.toLowerCase().includes(f) ||
-        r.name.toLowerCase().includes(f) ||
-        r.sector.toLowerCase().includes(f)
-    );
-  }, [filter, rows]);
-
-  async function addSym() {
-    const sym = tickerInput.trim().toUpperCase();
-    if (!sym) return;
-    if (rows.some((r) => r.ticker === sym)) {
-      setTickerInput("");
-      setCatalystInput("");
       return;
     }
-    let name = sym;
-    let sector = "—";
-    const prof = await fetchProfile(sym, token);
-    if (prof) {
-      name = prof.name;
-      sector = prof.sector;
+
+    setSyncStatus("joining");
+
+    const url = `/api/sync?id=${encodeURIComponent(syncId)}`;
+
+    // Initial pull
+    (async () => {
+      const j = await safeFetchJson<SyncGet>(url);
+      if (!j || !Array.isArray(j.rows)) {
+        setSyncStatus("error");
+        return;
+      }
+      setRows(j.rows);
+      lastSeenRef.current = Number(j.updatedAt || 0);
+      setSyncStatus("on");
+    })();
+
+    // Poll every 10s
+    pollRef.current = setInterval(async () => {
+      const j = await safeFetchJson<SyncGet>(url);
+      if (!j || typeof j.updatedAt !== "number") {
+        setSyncStatus("error");
+        return;
+      }
+      if (j.updatedAt > lastSeenRef.current) {
+        lastSeenRef.current = j.updatedAt;
+        if (Array.isArray(j.rows)) setRows(j.rows);
+      }
+      setSyncStatus("on");
+    }, 10_000);
+
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+  }, [syncId]);
+
+  // Push local changes to cloud when rows change and sync is on
+  useEffect(() => {
+    const doPut = async () => {
+      if (!syncId || syncStatus === "off" || syncStatus === "error") return;
+      const r = await safeFetchJson<SyncPut>(`/api/sync?id=${encodeURIComponent(syncId)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ rows }),
+      });
+      if (!r || ("error" in r && r.error)) {
+        setSyncStatus("error");
+      } else {
+        setSyncStatus("on");
+      }
+    };
+    // Debounce a bit to avoid spamming
+    const t = setTimeout(doPut, 350);
+    return () => clearTimeout(t);
+  }, [rows, syncId, syncStatus]);
+
+  // Chart loader whenever selected or timeframe changes
+  useEffect(() => {
+    if (!selected) {
+      setChart(null);
+      setChartMsg("Pick a stock to view a chart…");
+      return;
     }
-    setRows((prev) => [{ ticker: sym, name, sector, catalyst: catalystInput || "" }, ...prev]);
-    setTickerInput("");
-    setCatalystInput("");
+    const { range, interval } = TIMEFRAMES[tf];
+    const url = `/api/candles?symbol=${encodeURIComponent(selected)}&range=${range}&interval=${interval}`;
+
+    setChartLoading(true);
+    setChartMsg("Loading…");
+    (async () => {
+      const j = await safeFetchJson<unknown>(url);
+      const pts = normalizeCandles(j);
+      setChartLoading(false);
+      if (!pts.length) {
+        setChart(null);
+        setChartMsg("No data for this timeframe (try another range or market hours).");
+        return;
+        }
+      setChart(pts);
+      setChartMsg("");
+    })();
+  }, [selected, tf]);
+
+  // Derived
+  const chartData = useMemo(() => toChart(chart ?? []), [chart]);
+
+  // ---------- Handlers ----------
+  function addRow() {
+    const t = clampTicker(tickerIn);
+    if (!t) return;
+    const newRow: Row = {
+      ticker: t,
+      name: nameIn.trim() || t,
+      sector: sectorIn.trim(),
+      catalyst: catIn.trim(),
+    };
+    setRows((prev) => {
+      // prevent duplicates by ticker
+      if (prev.some((r) => r.ticker === t)) return prev;
+      return [newRow, ...prev];
+    });
+    setTickerIn("");
+    setNameIn("");
+    setSectorIn("");
+    setCatIn("");
   }
-  function removeSym(sym: string) {
-    setRows((prev) => prev.filter((r) => r.ticker !== sym));
-    if (selected?.ticker === sym) setSelected(null);
+
+  function removeRow(t: string) {
+    setRows((prev) => prev.filter((r) => r.ticker !== t));
+    if (selected === t) setSelected("");
   }
-  function clearAll() {
-    setRows([]);
-    setSelected(null);
+
+  function ensureSyncCode() {
+    // Create a new code locally if none yet
+    const code = syncId || newCode(8);
+    setSyncId(code);
     try {
-      localStorage.removeItem(STORAGE_KEY);
-    } catch {}
+      localStorage.setItem("syncId", code);
+    } catch {
+      /* ignore */
+    }
   }
 
-  const selectedKey = selected ? `${selected.ticker}_${tf}` : null;
-  const detailData: Candle[] = selectedKey ? chartCache[selectedKey] || [] : [];
-
-  /* ========= UI ========= */
+  // ---------- Render ----------
   return (
-    <div className="p-6 grid gap-4">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-end gap-3 justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-white">D6 Stock Tracker</h1>
-          <p className="text-sm text-gray-400 mt-1">
-            {token
-              ? isUSMarketOpenNow()
-                ? "Live: quotes via Finnhub (60s) — Market open"
-                : "Live: quotes via Finnhub (60s) — Market closed"
-              : "Add NEXT_PUBLIC_FINNHUB_KEY in .env.local to enable live quotes"}
-          </p>
-        </div>
-        <div className="flex items-center gap-3 w-full sm:w-auto">
-          <input
-            className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 w-full sm:w-64"
-            placeholder="Filter by ticker, name, sector"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-          />
-          <button
-            className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-3 py-2"
-            onClick={() => location.reload()}
-          >
-            Refresh
-          </button>
-        </div>
-      </div>
-
-      {/* Add / Clear */}
-      <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur p-4 grid gap-3">
-        <div className="flex flex-col md:flex-row gap-3">
+    <div className="min-h-[100dvh] text-gray-100 bg-gradient-to-br from-[#0b1020] via-[#0f1b2e] to-[#0a0f1e]">
+      <header className="px-5 sm:px-8 pt-6 pb-3 border-b border-white/10 bg-black/10 backdrop-blur sticky top-0 z-10">
+        <div className="max-w-6xl mx-auto flex flex-col sm:flex-row sm:items-end gap-4 sm:gap-6">
           <div className="flex-1">
-            <label className="text-xs text-gray-400">Ticker</label>
-            <input
-              className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 w-full"
-              placeholder="e.g., NVDA"
-              value={tickerInput}
-              onChange={(e) => setTickerInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addSym()}
-            />
+            <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">
+              D6 Stock Tracker
+            </h1>
+            <p className="text-sm text-gray-400">
+              Add tickers, click to view charts, and link devices with a sync code.
+            </p>
           </div>
-          <div className="flex-[2]">
-            <label className="text-xs text-gray-400">Catalyst (optional)</label>
-            <input
-              className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 w-full"
-              placeholder="Why this stock?"
-              value={catalystInput}
-              onChange={(e) => setCatalystInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addSym()}
-            />
-          </div>
-          <div className="flex gap-2">
-            <button className="bg-white/10 hover:bg-white/20 text-white rounded px-3 py-2" onClick={addSym}>
-              Add
-            </button>
-            <button
-              className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-3 py-2"
-              onClick={clearAll}
-            >
-              Clear All
-            </button>
-          </div>
-        </div>
-      </div>
 
-      {/* Table */}
-      <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur p-4 overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="text-gray-300">
-            <tr className="text-left">
-              <th className="p-2">Ticker</th>
-              <th className="p-2">Name</th>
-              <th className="p-2">Price</th>
-              <th className="p-2">Δ</th>
-              <th className="p-2">Δ%</th>
-              <th className="p-2">Sector</th>
-              <th className="p-2">Catalyst</th>
-              <th className="p-2">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="text-gray-200">
-            {filtered.map((s) => {
-              const q = quotes[s.ticker];
-              const up = (q?.change ?? 0) >= 0;
-              return (
-                <tr key={s.ticker} className="border-t border-white/10">
-                  <td className="p-2 font-semibold text-white">{s.ticker}</td>
-                  <td className="p-2">{s.name}</td>
-                  <td className="p-2">{fmt(q?.price)}</td>
-                  <td className={`p-2 ${up ? "text-emerald-400" : "text-rose-400"}`}>{fmt(q?.change)}</td>
-                  <td className={`p-2 ${up ? "text-emerald-400" : "text-rose-400"}`}>{fmt(q?.changePct)}</td>
-                  <td className="p-2">{s.sector}</td>
-                  <td className="p-2 min-w-[220px]">
-                    <input
-                      className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-2 py-1 w-full"
-                      value={s.catalyst}
-                      onChange={(e) =>
-                        setRows((prev) =>
-                          prev.map((r) => (r.ticker === s.ticker ? { ...r, catalyst: e.target.value } : r))
-                        )
-                      }
-                    />
-                  </td>
-                  <td className="p-2 space-x-2">
-                    <button
-                      className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-2 py-1"
-                      onClick={() => {
-                        setTf("3M");
-                        setSelected({ ticker: s.ticker, name: s.name });
-                      }}
-                    >
-                      View
-                    </button>
-                    <button
-                      className="border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-2 py-1"
-                      onClick={() => removeSym(s.ticker)}
-                    >
-                      Remove
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-            {filtered.length === 0 && (
-              <tr>
-                <td className="p-4 text-gray-400" colSpan={8}>
-                  No stocks yet — add a ticker above to get started.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+          {/* Sync panel */}
+          <div className="rounded-xl border border-white/10 bg-white/5 backdrop-blur p-3 grid gap-2 w-full sm:w-auto">
+            <div className="text-xs text-gray-400">
+              Sync status:{" "}
+              {syncStatus === "on" ? (
+                <span className="text-emerald-400">On</span>
+              ) : syncStatus === "joining" ? (
+                <span className="text-amber-300">Linking…</span>
+              ) : syncStatus === "error" ? (
+                <span className="text-rose-400">Error</span>
+              ) : (
+                <span className="text-gray-300">Off</span>
+              )}
+            </div>
 
-      {/* Detail chart */}
-      {selected && (
-        <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur p-4 grid gap-3">
-          <div className="flex items-center justify-between flex-wrap gap-2">
-            <div>
-              <div className="text-lg font-semibold text-white">
-                {selected.ticker} — {rows.find((r) => r.ticker === selected.ticker)?.name || selected.name}
+            <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-400">Your code:</span>
+                <code className="text-sm text-white bg-white/10 rounded px-2 py-1">
+                  {syncId || "—"}
+                </code>
+                <button
+                  className="text-xs border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-2 py-1"
+                  onClick={() => {
+                    ensureSyncCode();
+                    if (syncId) navigator.clipboard.writeText(syncId);
+                  }}
+                >
+                  {syncId ? "Copy" : "Create"}
+                </button>
               </div>
-              <div className="text-sm text-gray-400">
-                {rows.find((r) => r.ticker === selected.ticker)?.sector || ""}
+
+              <div className="flex gap-2">
+                <input
+                  className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-2 py-1"
+                  placeholder="Use a Sync Code"
+                  value={joinCode}
+                  onChange={(e) => setJoinCode(e.target.value)}
+                />
+                <button
+                  className="text-xs border border-white/10 bg-white/5 hover:bg-white/10 text-white rounded px-2 py-1"
+                  onClick={() => {
+                    const code = joinCode.trim().toUpperCase();
+                    if (!code) return;
+                    setSyncId(code);
+                    setJoinCode("");
+                    try {
+                      localStorage.setItem("syncId", code);
+                    } catch {
+                      /* ignore */
+                    }
+                  }}
+                >
+                  Link
+                </button>
               </div>
             </div>
-            <div className="flex gap-2">
-              {TIMEFRAMES.map((k) => (
-                <button
-                  key={k}
-                  className={`px-2 py-1 rounded border border-white/10 ${
-                    tf === k ? "bg-white/20 text-white" : "bg-white/5 hover:bg-white/10 text-gray-200"
-                  }`}
-                  onClick={() => setTf(k)}
-                >
-                  {k}
-                </button>
-              ))}
+
+            <div className="text-[11px] text-gray-400">
+              Tip: Paste the code into your phone to keep both in sync.
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="px-5 sm:px-8 py-6">
+        <div className="max-w-6xl mx-auto grid gap-6">
+          {/* Add row */}
+          <div className="rounded-xl border border-white/10 bg-white/5 backdrop-blur p-4 grid gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+              <input
+                className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2"
+                placeholder="Ticker (e.g., ACLS)"
+                value={tickerIn}
+                onChange={(e) => setTickerIn(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addRow()}
+              />
+              <input
+                className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2"
+                placeholder="Name"
+                value={nameIn}
+                onChange={(e) => setNameIn(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addRow()}
+              />
+              <input
+                className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2"
+                placeholder="Sector"
+                value={sectorIn}
+                onChange={(e) => setSectorIn(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addRow()}
+              />
+              <input
+                className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 col-span-2 sm:col-span-1"
+                placeholder="Catalyst"
+                value={catIn}
+                onChange={(e) => setCatIn(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addRow()}
+              />
+            </div>
+            <div className="flex justify-end">
               <button
-                className="px-2 py-1 rounded border border-white/10 bg-white/5 hover:bg-white/10 text-white"
-                onClick={() => setSelected(null)}
+                className="px-4 py-2 rounded-lg border border-emerald-400/30 text-emerald-300 bg-emerald-400/10 hover:bg-emerald-400/15"
+                onClick={addRow}
               >
-                Close
+                Add
               </button>
             </div>
           </div>
 
-          <div className="h-72 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={detailData} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
-                <XAxis
-                  dataKey="t"
-                  type="number"
-                  domain={["dataMin", "dataMax"]}
-                  tickFormatter={(ts) => new Date(Number(ts)).toLocaleDateString()}
-                  stroke="#334155"
-                  tick={{ fill: "#cbd5e1", fontSize: 12 }}
-                />
-                <YAxis domain={["auto", "auto"]} width={60} stroke="#334155" tick={{ fill: "#cbd5e1", fontSize: 12 }} />
-                <Tooltip
-                  formatter={(v: number) => fmt(Number(v))}
-                  labelFormatter={(ts) => new Date(Number(ts)).toLocaleString()}
-                  contentStyle={{
-                    background: "rgba(17, 24, 39, 0.9)",
-                    border: "1px solid rgba(255,255,255,0.1)",
-                    color: "#e5e7eb",
-                  }}
-                />
-                <Line type="monotone" dataKey="c" dot={false} strokeWidth={2} stroke="#ffffff" />
-              </LineChart>
-            </ResponsiveContainer>
+          {/* Table (desktop) */}
+          <div className="hidden md:block rounded-xl overflow-hidden border border-white/10">
+            <table className="w-full text-sm">
+              <thead className="bg-white/5 text-gray-300">
+                <tr>
+                  <th className="text-left px-4 py-2">Ticker</th>
+                  <th className="text-left px-4 py-2">Name</th>
+                  <th className="text-left px-4 py-2">Sector</th>
+                  <th className="text-left px-4 py-2">Catalyst</th>
+                  <th className="text-right px-4 py-2">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/10">
+                {rows.map((r) => (
+                  <tr
+                    key={r.ticker}
+                    className={`hover:bg-white/5 ${selected === r.ticker ? "bg-white/10" : ""}`}
+                  >
+                    <td
+                      className="px-4 py-2 cursor-pointer font-medium"
+                      onClick={() => setSelected(r.ticker)}
+                      title="Click to view chart"
+                    >
+                      {r.ticker}
+                    </td>
+                    <td className="px-4 py-2">{r.name}</td>
+                    <td className="px-4 py-2">{r.sector}</td>
+                    <td className="px-4 py-2">{r.catalyst}</td>
+                    <td className="px-4 py-2 text-right">
+                      <button
+                        className="text-rose-300 hover:text-rose-200"
+                        onClick={() => removeRow(r.ticker)}
+                        title="Remove"
+                      >
+                        Remove
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {rows.length === 0 && (
+                  <tr>
+                    <td className="px-4 py-8 text-center text-gray-400" colSpan={5}>
+                      No tickers yet — add one above to get started.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
 
-          <div className="text-xs text-gray-400">
-            {selected.ticker} {tf} • points: {detailData.length}
+          {/* Cards (mobile) */}
+          <div className="grid md:hidden gap-3">
+            {rows.map((r) => (
+              <div
+                key={r.ticker}
+                className={`rounded-xl border border-white/10 bg-white/5 p-3 ${selected === r.ticker ? "ring-1 ring-emerald-400/40" : ""}`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-semibold">{r.ticker}</div>
+                  <div className="text-xs text-gray-400">{r.sector}</div>
+                </div>
+                <div className="text-sm text-gray-300">{r.name}</div>
+                {r.catalyst && <div className="text-sm text-gray-400">{r.catalyst}</div>}
+                <div className="mt-3 flex gap-3">
+                  <button
+                    className="px-3 py-1 rounded border border-white/10 bg-white/5 hover:bg-white/10"
+                    onClick={() => setSelected(r.ticker)}
+                  >
+                    Chart
+                  </button>
+                  <button
+                    className="px-3 py-1 rounded border border-rose-400/30 text-rose-200 bg-rose-400/10 hover:bg-rose-400/15"
+                    onClick={() => removeRow(r.ticker)}
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ))}
+            {rows.length === 0 && (
+              <div className="text-center text-gray-400 py-8">
+                No tickers yet — add one above to get started.
+              </div>
+            )}
           </div>
 
-          {loading && <div className="text-sm text-gray-400">Loading chart…</div>}
-          {!loading && msg && <div className="text-sm text-gray-400">{msg}</div>}
+          {/* Chart panel */}
+          <div className="rounded-xl border border-white/10 bg-white/5 p-4 grid gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="font-semibold">
+                {selected ? `${selected} — Price Chart` : "Chart"}
+              </div>
+              <div className="flex gap-2">
+                {(Object.keys(TIMEFRAMES) as TimeKey[]).map((k) => (
+                  <button
+                    key={k}
+                    onClick={() => setTf(k)}
+                    className={`px-3 py-1 rounded border ${
+                      tf === k
+                        ? "border-emerald-400/40 text-emerald-200 bg-emerald-400/10"
+                        : "border-white/10 text-gray-200 bg-white/5 hover:bg-white/10"
+                    }`}
+                  >
+                    {TIMEFRAMES[k].label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {!selected && <div className="text-gray-400">{chartMsg}</div>}
+            {selected && chartLoading && <div className="text-gray-400">{chartMsg}</div>}
+            {selected && !chartLoading && chart && chart.length > 1 && (
+              <div className="h-[280px] sm:h-[340px]">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={chartData} margin={{ left: 8, right: 8, top: 8, bottom: 8 }}>
+                    <CartesianGrid strokeOpacity={0.15} />
+                    <XAxis
+                      dataKey="time"
+                      tick={{ fontSize: 12, fill: "rgba(255,255,255,0.7)" }}
+                      tickMargin={8}
+                    />
+                    <YAxis
+                      domain={["auto", "auto"]}
+                      tick={{ fontSize: 12, fill: "rgba(255,255,255,0.7)" }}
+                      tickMargin={8}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: "rgba(0,0,0,0.7)",
+                        border: "1px solid rgba(255,255,255,0.1)",
+                        borderRadius: 8,
+                        color: "#fff",
+                      }}
+                    />
+                    <Line type="monotone" dataKey="price" dot={false} strokeWidth={2} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+            {selected && !chartLoading && (!chart || chart.length <= 1) && (
+              <div className="text-gray-400">{chartMsg}</div>
+            )}
+          </div>
         </div>
-      )}
-
-      <div className="text-xs text-gray-500">Your list saves in this browser. Prices may be delayed.</div>
+      </main>
     </div>
   );
 }
