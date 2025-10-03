@@ -15,11 +15,20 @@ import {
 type Row = { ticker: string; name: string; sector: string; catalyst: string };
 type SyncStatus = "off" | "on" | "joining" | "error";
 type CandlePoint = { t: number; c: number }; // epoch ms, close
+type TimeKey = "5D" | "1M" | "3M" | "1Y" | "5Y";
 
 type SyncGet = { rows: Row[]; updatedAt: number };
 type SyncPut = { ok: true } | { error: string };
 
-type TimeKey = "5D" | "1M" | "3M" | "1Y" | "5Y";
+type QuoteResp =
+  | { price: number; change: number; changePct: number }
+  | { price: null; change: number; changePct: number }
+  | { error: string };
+
+type QuoteMap = Record<
+  string,
+  { price: number | null; change: number; changePct: number }
+>;
 
 // ---------- Timeframe map for /api/candles ----------
 const TIMEFRAMES: Record<TimeKey, { range: string; interval: string; label: string }> = {
@@ -32,7 +41,7 @@ const TIMEFRAMES: Record<TimeKey, { range: string; interval: string; label: stri
 
 // ---------- Helpers ----------
 const clampTicker = (s: string) =>
-  s.toUpperCase().trim().replace(/[^A-Z0-9\.\-]/g, "").slice(0, 8);
+  s.toUpperCase().trim().replace(/[^A-Z0-9.\-]/g, "").slice(0, 8);
 
 function newCode(len = 8) {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -62,9 +71,8 @@ function toChart(points: CandlePoint[]): { time: string; price: number }[] {
   }));
 }
 
-// Try to normalize various /api/candles shapes into CandlePoint[]
 function normalizeCandles(j: unknown): CandlePoint[] {
-  // Accept { t: number[], c: number[] }
+  // { t: number[], c: number[] }
   if (
     j &&
     typeof j === "object" &&
@@ -77,14 +85,12 @@ function normalizeCandles(j: unknown): CandlePoint[] {
       for (let i = 0; i < o.t.length; i++) {
         const ts = Number(o.t[i]);
         const cl = Number(o.c[i]);
-        if (Number.isFinite(ts) && Number.isFinite(cl)) {
-          out.push({ t: ts, c: cl });
-        }
+        if (Number.isFinite(ts) && Number.isFinite(cl)) out.push({ t: ts, c: cl });
       }
       return out;
     }
   }
-  // Accept { points: [{t,c}] }
+  // { points: [{t,c}] }
   if (j && typeof j === "object" && "points" in (j as Record<string, unknown>)) {
     const o = j as { points?: unknown };
     if (Array.isArray(o.points)) {
@@ -99,7 +105,7 @@ function normalizeCandles(j: unknown): CandlePoint[] {
       return out;
     }
   }
-  // Accept array [{t,c}]
+  // Array<{t,c}>
   if (Array.isArray(j)) {
     const out: CandlePoint[] = [];
     for (const v of j) {
@@ -114,16 +120,28 @@ function normalizeCandles(j: unknown): CandlePoint[] {
   return [];
 }
 
+function fmt(n: number | null | undefined, digits = 2) {
+  if (n == null || Number.isNaN(n)) return "—";
+  return n.toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+
 // ---------- Page ----------
 export default function StocksPage() {
-  // UI / theme is handled by Tailwind classes here (nightfall gradient)
+  // Data
   const [rows, setRows] = useState<Row[]>([]);
+  const [quotes, setQuotes] = useState<QuoteMap>({});
+
+  // Inputs
   const [tickerIn, setTickerIn] = useState("");
   const [nameIn, setNameIn] = useState("");
   const [sectorIn, setSectorIn] = useState("");
   const [catIn, setCatIn] = useState("");
 
-  const [selected, setSelected] = useState<string>(""); // ticker for chart
+  // Chart
+  const [selected, setSelected] = useState<string>("");
   const [tf, setTf] = useState<TimeKey>("3M");
   const [chart, setChart] = useState<CandlePoint[] | null>(null);
   const [chartMsg, setChartMsg] = useState<string>("Pick a stock to view a chart…");
@@ -136,7 +154,7 @@ export default function StocksPage() {
   const lastSeenRef = useRef<number>(0);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Load stored sync code + rows from localStorage first
+  // Load stored sync code + rows locally
   useEffect(() => {
     try {
       const sid = localStorage.getItem("syncId");
@@ -146,21 +164,17 @@ export default function StocksPage() {
         const parsed = JSON.parse(cache) as Row[];
         if (Array.isArray(parsed)) setRows(parsed);
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, []);
 
-  // Persist rows locally (so the page keeps your watchlist even w/out sync)
+  // Persist rows locally
   useEffect(() => {
     try {
       localStorage.setItem("rows", JSON.stringify(rows));
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }, [rows]);
 
-  // Start or stop polling when syncId changes
+  // Start/stop polling Upstash
   useEffect(() => {
     if (!syncId) {
       setSyncStatus("off");
@@ -172,10 +186,8 @@ export default function StocksPage() {
     }
 
     setSyncStatus("joining");
-
     const url = `/api/sync?id=${encodeURIComponent(syncId)}`;
 
-    // Initial pull
     (async () => {
       const j = await safeFetchJson<SyncGet>(url);
       if (!j || !Array.isArray(j.rows)) {
@@ -187,7 +199,6 @@ export default function StocksPage() {
       setSyncStatus("on");
     })();
 
-    // Poll every 10s
     pollRef.current = setInterval(async () => {
       const j = await safeFetchJson<SyncGet>(url);
       if (!j || typeof j.updatedAt !== "number") {
@@ -218,18 +229,44 @@ export default function StocksPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ rows }),
       });
-      if (!r || ("error" in r && r.error)) {
-        setSyncStatus("error");
-      } else {
-        setSyncStatus("on");
-      }
+      if (!r || ("error" in r && r.error)) setSyncStatus("error");
+      else setSyncStatus("on");
     };
-    // Debounce a bit to avoid spamming
-    const t = setTimeout(doPut, 350);
+    const t = setTimeout(doPut, 300);
     return () => clearTimeout(t);
   }, [rows, syncId, syncStatus]);
 
-  // Chart loader whenever selected or timeframe changes
+  // Quotes: fetch on load and every 20s for current rows
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    async function fetchQuotes() {
+      if (!rows.length) {
+        setQuotes({});
+        return;
+      }
+      const symbols = rows.map((r) => r.ticker);
+      const next: QuoteMap = {};
+      const tasks = symbols.map(async (sym) => {
+        const q = await safeFetchJson<QuoteResp>(`/api/quote?symbol=${encodeURIComponent(sym)}`);
+        if (!q || "error" in q) {
+          next[sym] = { price: null, change: 0, changePct: 0 };
+        } else {
+          next[sym] = { price: q.price, change: q.change, changePct: q.changePct };
+        }
+      });
+      await Promise.all(tasks);
+      setQuotes(next);
+    }
+
+    fetchQuotes();
+    timer = setInterval(fetchQuotes, 20_000);
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [rows]);
+
+  // Chart loader when selected or timeframe changes
   useEffect(() => {
     if (!selected) {
       setChart(null);
@@ -238,7 +275,6 @@ export default function StocksPage() {
     }
     const { range, interval } = TIMEFRAMES[tf];
     const url = `/api/candles?symbol=${encodeURIComponent(selected)}&range=${range}&interval=${interval}`;
-
     setChartLoading(true);
     setChartMsg("Loading…");
     (async () => {
@@ -249,16 +285,15 @@ export default function StocksPage() {
         setChart(null);
         setChartMsg("No data for this timeframe (try another range or market hours).");
         return;
-        }
+      }
       setChart(pts);
       setChartMsg("");
     })();
   }, [selected, tf]);
 
-  // Derived
   const chartData = useMemo(() => toChart(chart ?? []), [chart]);
 
-  // ---------- Handlers ----------
+  // Actions
   function addRow() {
     const t = clampTicker(tickerIn);
     if (!t) return;
@@ -268,31 +303,22 @@ export default function StocksPage() {
       sector: sectorIn.trim(),
       catalyst: catIn.trim(),
     };
-    setRows((prev) => {
-      // prevent duplicates by ticker
-      if (prev.some((r) => r.ticker === t)) return prev;
-      return [newRow, ...prev];
-    });
+    setRows((prev) => (prev.some((r) => r.ticker === t) ? prev : [newRow, ...prev]));
     setTickerIn("");
     setNameIn("");
     setSectorIn("");
     setCatIn("");
   }
-
   function removeRow(t: string) {
     setRows((prev) => prev.filter((r) => r.ticker !== t));
     if (selected === t) setSelected("");
   }
-
   function ensureSyncCode() {
-    // Create a new code locally if none yet
     const code = syncId || newCode(8);
     setSyncId(code);
     try {
       localStorage.setItem("syncId", code);
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }
 
   // ---------- Render ----------
@@ -305,7 +331,7 @@ export default function StocksPage() {
               D6 Stock Tracker
             </h1>
             <p className="text-sm text-gray-400">
-              Add tickers, click to view charts, and link devices with a sync code.
+              Add tickers, see live prices, click to view charts, and link devices with a sync code.
             </p>
           </div>
 
@@ -357,9 +383,7 @@ export default function StocksPage() {
                     setJoinCode("");
                     try {
                       localStorage.setItem("syncId", code);
-                    } catch {
-                      /* ignore */
-                    }
+                    } catch {}
                   }}
                 >
                   Link
@@ -378,7 +402,7 @@ export default function StocksPage() {
         <div className="max-w-6xl mx-auto grid gap-6">
           {/* Add row */}
           <div className="rounded-xl border border-white/10 bg-white/5 backdrop-blur p-4 grid gap-3">
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-6 gap-3">
               <input
                 className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2"
                 placeholder="Ticker (e.g., ACLS)"
@@ -401,7 +425,7 @@ export default function StocksPage() {
                 onKeyDown={(e) => e.key === "Enter" && addRow()}
               />
               <input
-                className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 col-span-2 sm:col-span-1"
+                className="border border-white/10 bg-white/5 text-gray-100 placeholder:text-gray-400 rounded px-3 py-2 col-span-2 sm:col-span-2"
                 placeholder="Catalyst"
                 value={catIn}
                 onChange={(e) => setCatIn(e.target.value)}
@@ -426,40 +450,56 @@ export default function StocksPage() {
                   <th className="text-left px-4 py-2">Ticker</th>
                   <th className="text-left px-4 py-2">Name</th>
                   <th className="text-left px-4 py-2">Sector</th>
-                  <th className="text-left px-4 py-2">Catalyst</th>
+                  <th className="text-right px-4 py-2">Price</th>
+                  <th className="text-right px-4 py-2">Change %</th>
                   <th className="text-right px-4 py-2">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/10">
-                {rows.map((r) => (
-                  <tr
-                    key={r.ticker}
-                    className={`hover:bg-white/5 ${selected === r.ticker ? "bg-white/10" : ""}`}
-                  >
-                    <td
-                      className="px-4 py-2 cursor-pointer font-medium"
-                      onClick={() => setSelected(r.ticker)}
-                      title="Click to view chart"
+                {rows.map((r) => {
+                  const q = quotes[r.ticker];
+                  const pct = q?.changePct ?? 0;
+                  const pctClass =
+                    q && q.price != null
+                      ? pct > 0
+                        ? "text-emerald-300"
+                        : pct < 0
+                        ? "text-rose-300"
+                        : "text-gray-300"
+                      : "text-gray-400";
+                  return (
+                    <tr
+                      key={r.ticker}
+                      className={`hover:bg-white/5 ${selected === r.ticker ? "bg-white/10" : ""}`}
                     >
-                      {r.ticker}
-                    </td>
-                    <td className="px-4 py-2">{r.name}</td>
-                    <td className="px-4 py-2">{r.sector}</td>
-                    <td className="px-4 py-2">{r.catalyst}</td>
-                    <td className="px-4 py-2 text-right">
-                      <button
-                        className="text-rose-300 hover:text-rose-200"
-                        onClick={() => removeRow(r.ticker)}
-                        title="Remove"
+                      <td
+                        className="px-4 py-2 cursor-pointer font-medium"
+                        onClick={() => setSelected(r.ticker)}
+                        title="Click to view chart"
                       >
-                        Remove
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                        {r.ticker}
+                      </td>
+                      <td className="px-4 py-2">{r.name}</td>
+                      <td className="px-4 py-2">{r.sector}</td>
+                      <td className="px-4 py-2 text-right">{fmt(q?.price)}</td>
+                      <td className={`px-4 py-2 text-right ${pctClass}`}>
+                        {q && q.price != null ? `${fmt(pct, 2)}%` : "—"}
+                      </td>
+                      <td className="px-4 py-2 text-right">
+                        <button
+                          className="text-rose-300 hover:text-rose-200"
+                          onClick={() => removeRow(r.ticker)}
+                          title="Remove"
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
                 {rows.length === 0 && (
                   <tr>
-                    <td className="px-4 py-8 text-center text-gray-400" colSpan={5}>
+                    <td className="px-4 py-8 text-center text-gray-400" colSpan={6}>
                       No tickers yet — add one above to get started.
                     </td>
                   </tr>
@@ -470,33 +510,53 @@ export default function StocksPage() {
 
           {/* Cards (mobile) */}
           <div className="grid md:hidden gap-3">
-            {rows.map((r) => (
-              <div
-                key={r.ticker}
-                className={`rounded-xl border border-white/10 bg-white/5 p-3 ${selected === r.ticker ? "ring-1 ring-emerald-400/40" : ""}`}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="font-semibold">{r.ticker}</div>
-                  <div className="text-xs text-gray-400">{r.sector}</div>
+            {rows.map((r) => {
+              const q = quotes[r.ticker];
+              const pct = q?.changePct ?? 0;
+              const pctClass =
+                q && q.price != null
+                  ? pct > 0
+                    ? "text-emerald-300"
+                    : pct < 0
+                    ? "text-rose-300"
+                    : "text-gray-300"
+                  : "text-gray-400";
+              return (
+                <div
+                  key={r.ticker}
+                  className={`rounded-xl border border-white/10 bg-white/5 p-3 ${selected === r.ticker ? "ring-1 ring-emerald-400/40" : ""}`}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="font-semibold">{r.ticker}</div>
+                    <div className="text-xs text-gray-400">{r.sector}</div>
+                  </div>
+                  <div className="text-sm text-gray-300">{r.name}</div>
+                  {r.catalyst && <div className="text-sm text-gray-400">{r.catalyst}</div>}
+
+                  <div className="mt-2 flex items-center justify-between">
+                    <div className="text-gray-200">Price: {fmt(q?.price)}</div>
+                    <div className={`text-sm ${pctClass}`}>
+                      {q && q.price != null ? `${fmt(pct, 2)}%` : "—"}
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex gap-3">
+                    <button
+                      className="px-3 py-1 rounded border border-white/10 bg-white/5 hover:bg-white/10"
+                      onClick={() => setSelected(r.ticker)}
+                    >
+                      Chart
+                    </button>
+                    <button
+                      className="px-3 py-1 rounded border border-rose-400/30 text-rose-200 bg-rose-400/10 hover:bg-rose-400/15"
+                      onClick={() => removeRow(r.ticker)}
+                    >
+                      Remove
+                    </button>
+                  </div>
                 </div>
-                <div className="text-sm text-gray-300">{r.name}</div>
-                {r.catalyst && <div className="text-sm text-gray-400">{r.catalyst}</div>}
-                <div className="mt-3 flex gap-3">
-                  <button
-                    className="px-3 py-1 rounded border border-white/10 bg-white/5 hover:bg-white/10"
-                    onClick={() => setSelected(r.ticker)}
-                  >
-                    Chart
-                  </button>
-                  <button
-                    className="px-3 py-1 rounded border border-rose-400/30 text-rose-200 bg-rose-400/10 hover:bg-rose-400/15"
-                    onClick={() => removeRow(r.ticker)}
-                  >
-                    Remove
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
             {rows.length === 0 && (
               <div className="text-center text-gray-400 py-8">
                 No tickers yet — add one above to get started.
